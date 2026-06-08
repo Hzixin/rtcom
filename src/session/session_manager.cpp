@@ -173,6 +173,7 @@ SessionManager::CallContext* SessionManager::GetOrCreateContext(
     // Jitter buffers
     JitterBufferConfig jb_cfg;
     jb_cfg.sample_rate = config_.media.audio_sample_rate;
+    jb_cfg.initial_delay_ms = 0;  // Immediate output for testing
     ctx->audio_jitter = std::make_unique<JitterBuffer>(jb_cfg);
     ctx->video_jitter = std::make_unique<JitterBuffer>(jb_cfg);
 
@@ -224,7 +225,14 @@ void SessionManager::OnSipEvent(const std::string& call_id, SipCallState state) 
     switch (state) {
         case SipCallState::kConnected: {
             auto* call = sip_mgr_.GetCall(call_id);
-            if (call) GetOrCreateContext(call_id, call->SessionInfo());
+            if (call) {
+                auto* ctx = GetOrCreateContext(call_id, call->SessionInfo());
+                // Sync context ports back to SIP call (for SDP answer)
+                if (ctx) {
+                    call->SessionInfo().audio_local_port = ctx->info.audio_local_port;
+                    call->SessionInfo().video_local_port = ctx->info.video_local_port;
+                }
+            }
             break;
         }
         case SipCallState::kDisconnected:
@@ -266,7 +274,7 @@ void SessionManager::RegisterRtpFds(CallContext* ctx) {
                 // Extract ready packets and decode
                 RtpPacket* ready = jb->Extract();
                 if (ready) {
-                    OnRtpData(cid, RtpPayloadType::kAAC,
+                    OnRtpData(cid, static_cast<RtpPayloadType>(ready->PayloadType()),
                               ready->PayloadData(), ready->PayloadSize());
                 }
             }
@@ -338,6 +346,15 @@ void SessionManager::OnRtpData(const std::string& call_id, RtpPayloadType pt,
                                   pcm.size() * sizeof(int16_t), pt);
                 }
             }
+        } else {
+            LOG(WARNING) << "AAC unpack failed for " << call_id;
+        }
+    } else if (pt == RtpPayloadType::kPCMU || pt == RtpPayloadType::kPCMA) {
+        // Raw G.711 audio — pass through directly
+        LOG(INFO) << "Raw audio: " << len << " bytes (PT=" << static_cast<int>(pt)
+                  << ") for " << call_id;
+        if (rtp_callback_) {
+            rtp_callback_(call_id, payload, len, pt);
         }
     } else if (pt == RtpPayloadType::kH264 && ctx->video_decoder) {
         std::vector<uint8_t> yuv;
@@ -349,6 +366,9 @@ void SessionManager::OnRtpData(const std::string& call_id, RtpPayloadType pt,
                 rtp_callback_(call_id, yuv.data(), yuv.size(), pt);
             }
         }
+    } else {
+        LOG(WARNING) << "Unsupported payload type: " << static_cast<int>(pt)
+                     << " for " << call_id;
     }
 }
 

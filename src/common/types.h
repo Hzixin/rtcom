@@ -62,7 +62,7 @@ constexpr size_t kRtpHeaderSize = 12;
 constexpr size_t kRtpMaxPayloadSize = 1460;    // Ethernet MTU safe
 constexpr size_t kRtcpMaxPacketSize = 1500;
 constexpr uint16_t kDefaultAudioPort = 5004;
-constexpr uint16_t kDefaultVideoPort = 5006;
+constexpr uint16_t kDefaultVideoPort = 5010;
 constexpr uint32_t kJitterBufferMaxMs = 200;    // Max jitter buffer in ms
 constexpr uint32_t kJitterBufferMinMs = 20;     // Min jitter buffer in ms
 
