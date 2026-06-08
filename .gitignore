@@ -1,0 +1,16 @@
+build/
+*.o
+*.a
+*.so
+*.pcap
+logs/
+.DS_Store
+.claude/
+*.swp
+*.swo
+*~
+
+# Planning files
+task_plan.md
+findings.md
+progress.md
