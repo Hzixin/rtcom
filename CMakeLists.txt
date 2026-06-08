@@ -21,6 +21,7 @@ find_package(Threads REQUIRED)
 # Common headers
 set(COMMON_SRC
     src/common/config.cpp
+    src/common/sdp.cpp
 )
 
 # SIP module

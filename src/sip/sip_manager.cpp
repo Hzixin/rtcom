@@ -1,10 +1,13 @@
 #include <glog/logging.h>
-#undef WARNING  // Prevent glog/osip2 macro conflict
+#undef WARNING
 
 #include "sip_manager.h"
+#include "common/sdp.h"
 #include <osip2/osip_mt.h>
+#include <osipparser2/osip_parser.h>
 #include <sstream>
 #include <random>
+#include <cstdio>
 
 namespace rtcom {
 
@@ -154,8 +157,11 @@ std::string SipManager::BuildInviteRequest(const std::string& call_id,
     m << "CSeq: " << GenerateCSeq() << " INVITE\r\n";
     m << "Contact: <" << lu << ">\r\n";
     m << "Content-Type: application/sdp\r\n";
-    m << "Content-Length: 0\r\n\r\n";
-    return m.str();
+    // Build and attach SDP
+    std::string sdp = SdpBuilder::BuildOffer(config_.local_addr,
+        config_.local_port + 1000, config_.local_port + 1002, 96, 97);
+    m << "Content-Length: " << sdp.size() << "\r\n\r\n";
+    m << sdp;    return m.str();
 }
 
 std::string SipManager::BuildAckRequest(const std::string& call_id) {
@@ -239,6 +245,28 @@ void SipManager::HandleInvite(osip_message_t* msg, const std::string&) {
     osip_call_id_t* call_id_obj = osip_message_get_call_id(msg);
     std::string call_id = call_id_obj ? (call_id_obj->number ? call_id_obj->number : "") : "";
     if (call_id.empty()) return;
+
+    // Cache headers for response echoing
+    last_call_id_ = call_id;
+
+    // Extract Via branch
+    if (osip_list_size(&msg->vias) > 0) {
+        osip_via_t* via = (osip_via_t*)osip_list_get(&msg->vias, 0);
+        osip_generic_param_t* branch_param = nullptr;
+        osip_via_param_get_byname(via, "branch", &branch_param);
+        if (branch_param && branch_param->gvalue) last_via_branch_ = branch_param->gvalue;
+    }
+
+    // Extract From tag
+    osip_generic_param_t* tag_param = nullptr;
+    osip_from_get_tag(msg->from, &tag_param);
+    if (tag_param && tag_param->gvalue) last_from_tag_ = tag_param->gvalue;
+
+    // Extract CSeq (number is char*, method is char*)
+    if (msg->cseq) {
+        last_cseq_ = std::string(msg->cseq->number ? msg->cseq->number : "0")
+                     + " " + (msg->cseq->method ? msg->cseq->method : "INVITE");
+    }
 
     // Get remote URI from From header
     std::string remote = "unknown";
@@ -351,6 +379,115 @@ SipCallState SipManager::GetCallState(const std::string& call_id) const {
 SipCall* SipManager::GetCall(const std::string& call_id) {
     auto it = calls_.find(call_id);
     return (it != calls_.end()) ? it->second.get() : nullptr;
+}
+
+// ========== Cache & Echo INVITE Headers ==========
+
+void SipManager::CacheLastRequest(const std::string& call_id) {
+    last_call_id_ = call_id;
+}
+
+std::string SipManager::BuildInviteResponse(int status_code, const std::string& reason,
+                                            const std::string& sdp) {
+    std::ostringstream m;
+    std::string lu = "sip:" + config_.username + "@" + config_.domain;
+
+    m << "SIP/2.0 " << status_code << " " << reason << "\r\n";
+
+    // Echo Via from original request
+    m << "Via: SIP/2.0/UDP " << config_.local_addr << ":" << config_.local_port;
+    if (!last_via_branch_.empty()) m << ";branch=" << last_via_branch_;
+    m << "\r\n";
+
+    // Echo From (with original tag)
+    m << "From: <sip:remote@" << config_.domain << ">";
+    if (!last_from_tag_.empty()) m << ";tag=" << last_from_tag_;
+    m << "\r\n";
+
+    // To (add our tag if 200 OK)
+    m << "To: <" << lu << ">";
+    if (!last_to_tag_.empty()) m << ";tag=" << last_to_tag_;
+    else if (status_code == 200) m << ";tag=" << GenerateTag();
+    m << "\r\n";
+
+    // Echo Call-ID
+    m << "Call-ID: " << (last_call_id_.empty() ? GenerateCallId() : last_call_id_) << "\r\n";
+
+    // Echo CSeq
+    // last_cseq_ already contains method (e.g. "1 INVITE"), don't append " INVITE" again
+    m << "CSeq: " << (last_cseq_.empty() ? std::to_string(GenerateCSeq()) + " INVITE" : last_cseq_) << "\r\n";
+
+    m << "Contact: <" << lu << ">\r\n";
+
+    if (!sdp.empty()) {
+        m << "Content-Type: application/sdp\r\n";
+        m << "Content-Length: " << sdp.size() << "\r\n\r\n";
+        m << sdp;
+    } else {
+        m << "Content-Length: 0\r\n\r\n";
+    }
+    return m.str();
+}
+
+// ========== SDP Negotiation ==========
+
+std::string SipManager::BuildResponseWithSdp(int status_code, const std::string& reason,
+                                             const std::string& sdp, const std::string& to_tag) {
+    std::ostringstream m;
+    std::string lu = "sip:" + config_.username + "@" + config_.domain;
+    m << "SIP/2.0 " << status_code << " " << reason << "\r\n";
+    m << "Via: SIP/2.0/UDP " << config_.local_addr << ":" << config_.local_port
+      << ";branch=" << GenerateBranchId() << "\r\n";
+    m << "From: <sip:remote@" << config_.domain << ">;tag=" << GenerateTag() << "\r\n";
+    m << "To: <" << lu << ">;tag=" << (to_tag.empty() ? GenerateTag() : to_tag) << "\r\n";
+    m << "Call-ID: " << RandomHex(16) << "\r\n";
+    m << "CSeq: " << GenerateCSeq() << " INVITE\r\n";
+    m << "Contact: <" << lu << ">\r\n";
+    m << "Content-Type: application/sdp\r\n";
+    m << "Content-Length: " << sdp.size() << "\r\n\r\n";
+    m << sdp;
+    return m.str();
+}
+
+bool SipManager::ProcessIncomingSdp(const std::string& call_id, const std::string& sdp_body) {
+    SdpSession sess;
+    if (!SdpBuilder::Parse(sdp_body, sess)) {
+        LOG(WARNING) << "Failed to parse SDP for call " << call_id;
+        return false;
+    }
+
+    auto it = calls_.find(call_id);
+    if (it == calls_.end()) return false;
+    auto& info = it->second->SessionInfo();
+
+    // Extract remote RTP address (c= line) and ports (m= lines)
+    info.remote_rtp_addr = sess.conn_addr;
+
+    auto* audio = sess.FindAudio();
+    if (audio) {
+        info.audio_remote_port = audio->port;
+        LOG(INFO) << "SDP: remote audio " << info.remote_rtp_addr << ":" << audio->port;
+    }
+
+    auto* video = sess.FindVideo();
+    if (video) {
+        info.video_remote_port = video->port;
+        LOG(INFO) << "SDP: remote video " << info.remote_rtp_addr << ":" << video->port;
+    }
+
+    return true;
+}
+
+std::string SipManager::BuildSdpAnswer(const std::string& call_id) {
+    auto it = calls_.find(call_id);
+    if (it == calls_.end()) return "";
+
+    auto& info = it->second->SessionInfo();
+    // Our RTP recv ports = send ports + 2 (as opened in GetOrCreateContext)
+    return SdpBuilder::BuildAnswer(config_.local_addr,
+                                   info.audio_local_port + 2,   // audio recv
+                                   info.video_local_port + 2,   // video recv
+                                   96, 97);
 }
 
 void SipManager::NotifyStateChange(const std::string& call_id, SipCallState state) {

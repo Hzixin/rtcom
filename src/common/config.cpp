@@ -33,6 +33,7 @@ ServerConfig Config::LoadFromFile(const std::string& path) {
 
         if (key == "sip_server_addr") config.sip.server_addr = val;
         else if (key == "sip_server_port") config.sip.server_port = std::stoi(val);
+        else if (key == "sip_local_port") config.sip.local_port = std::stoi(val);
         else if (key == "sip_username") config.sip.username = val;
         else if (key == "sip_domain") config.sip.domain = val;
         else if (key == "sip_password") config.sip.password = val;
